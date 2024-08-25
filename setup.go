@@ -21,7 +21,7 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/go-piv/piv-go/piv"
+	"github.com/go-piv/piv-go/v2/piv"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 )
@@ -100,10 +100,11 @@ func runSetup(yk *piv.YubiKey) {
 	fmt.Println("")
 	fmt.Println("🧪 Reticulating splines...")
 
-	var key [24]byte
-	if _, err := rand.Read(key[:]); err != nil {
+	var tmp [24]byte
+	if _, err := rand.Read(tmp[:]); err != nil {
 		log.Fatal(err)
 	}
+	key := tmp[:]
 	if err := yk.SetManagementKey(piv.DefaultManagementKey, key); err != nil {
 		log.Println("‼️  The default Management Key did not work")
 		log.Println("")
