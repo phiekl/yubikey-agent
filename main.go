@@ -13,6 +13,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -32,7 +33,8 @@ import (
 	"github.com/go-piv/piv-go/v2/piv"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/crypto/ssh/terminal"
+
+	"github.com/awnumar/memguard"
 )
 
 func main() {
@@ -43,13 +45,15 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\n")
 		fmt.Fprintf(os.Stderr, "\t\tGenerate a new SSH key on the attached YubiKey.\n")
 		fmt.Fprintf(os.Stderr, "\n")
-		fmt.Fprintf(os.Stderr, "\tyubikey-agent -l PATH\n")
+		fmt.Fprintf(os.Stderr, "\tyubikey-agent -l PATH [-s SLOT]\n")
 		fmt.Fprintf(os.Stderr, "\n")
 		fmt.Fprintf(os.Stderr, "\t\tRun the agent, listening on the UNIX socket at PATH.\n")
+		fmt.Fprintf(os.Stderr, "\t\tSlot can be set to one of: aut, sig, enc\n")
 		fmt.Fprintf(os.Stderr, "\n")
 	}
 
 	socketPath := flag.String("l", "", "agent: path of the UNIX socket to listen on")
+	slotName := flag.String("s", "aut", "agent: name of PIV slot (aut/sig/enc)")
 	resetFlag := flag.Bool("really-delete-all-piv-keys", false, "setup: reset the PIV applet")
 	setupFlag := flag.Bool("setup", false, "setup: configure a new YubiKey")
 	flag.Parse()
@@ -71,18 +75,39 @@ func main() {
 			flag.Usage()
 			os.Exit(1)
 		}
-		runAgent(*socketPath)
+		runAgent(*socketPath, *slotName)
 	}
 }
 
-func runAgent(socketPath string) {
-	if terminal.IsTerminal(int(os.Stdin.Fd())) {
-		log.Println("Warning: yubikey-agent is meant to run as a background daemon.")
-		log.Println("Running multiple instances is likely to lead to conflicts.")
-		log.Println("Consider using the launchd or systemd services.")
+func runAgent(socketPath string, slotNumStr string) {
+	var slot piv.Slot
+	if len(slotNumStr) != 2 {
+		log.Fatalf("Slot number must be exactly two characters.\n")
+	}
+	slotNumStr = strings.ToLower(slotNumStr)
+	switch slotNumStr {
+	case "9a":
+		slot = piv.SlotAuthentication
+	case "9c":
+		slot = piv.SlotSignature
+	case "9d":
+		slot = piv.SlotKeyManagement
+	case "9e":
+		slot = piv.SlotCardAuthentication
+	default:
+		slotNumDec := make([]byte, 1)
+		_, err := hex.Decode(slotNumDec, []byte(slotNumStr))
+		if err != nil {
+			log.Fatalf("Failed decoding slot number %q as hex bytes.\n", slotNumStr)
+		}
+		slotNumInt := uint32(slotNumDec[0])
+		var ok bool
+		if slot, ok = piv.RetiredKeyManagementSlot(slotNumInt); !ok {
+			log.Fatalln("Invalid slot number:", slotNumStr)
+		}
 	}
 
-	a := &Agent{}
+	a := &Agent{slot: slot}
 
 	c := make(chan os.Signal)
 	signal.Notify(c, syscall.SIGHUP)
@@ -100,6 +125,9 @@ func runAgent(socketPath string) {
 	if err != nil {
 		log.Fatalln("Failed to listen on UNIX socket:", err)
 	}
+
+	memguard.CatchInterrupt()
+	defer memguard.Purge()
 
 	for {
 		c, err := l.Accept()
@@ -122,6 +150,8 @@ type Agent struct {
 	mu     sync.Mutex
 	yk     *piv.YubiKey
 	serial uint32
+	slot   piv.Slot
+	pin    *memguard.Enclave
 
 	// touchNotification is armed by Sign to show a notification if waiting for
 	// more than a few seconds for the touch operation. It is paused and reset
@@ -165,7 +195,7 @@ func (a *Agent) maybeReleaseYK() {
 	// On macOS, YubiKey 5s persist the PIN cache even across sessions (and even
 	// processes), so we can release the lock on the key, to let other
 	// applications like age-plugin-yubikey use it.
-	if runtime.GOOS != "darwin" || a.yk.Version().Major < 5 {
+	if a.yk.Version().Major < 5 {
 		return
 	}
 	if err := a.yk.Close(); err != nil {
@@ -220,8 +250,21 @@ func (a *Agent) getPIN() (string, error) {
 	if a.touchNotification != nil && a.touchNotification.Stop() {
 		defer a.touchNotification.Reset(5 * time.Second)
 	}
-	r, _ := a.yk.Retries()
-	return getPIN(a.serial, r)
+	if a.pin == nil {
+		r, _ := a.yk.Retries()
+		pin, err := getPIN(a.serial, r)
+		if err != nil {
+			return "", err
+		}
+		a.pin = memguard.NewEnclave([]byte(pin))
+	}
+
+	keyBuf, err := a.pin.Open()
+	if err != nil {
+		return "", err
+	}
+
+	return keyBuf.String(), nil
 }
 
 func (a *Agent) List() ([]*agent.Key, error) {
@@ -232,14 +275,14 @@ func (a *Agent) List() ([]*agent.Key, error) {
 	}
 	defer a.maybeReleaseYK()
 
-	pk, err := getPublicKey(a.yk, piv.SlotAuthentication)
+	pk, err := getPublicKey(a.yk, a.slot)
 	if err != nil {
 		return nil, err
 	}
 	return []*agent.Key{{
 		Format:  pk.Type(),
 		Blob:    pk.Marshal(),
-		Comment: fmt.Sprintf("YubiKey #%d PIV Slot 9a", a.serial),
+		Comment: fmt.Sprintf("YubiKey #%d PIV Slot %s", a.serial, a.slot),
 	}}, nil
 }
 
@@ -274,12 +317,12 @@ func (a *Agent) Signers() ([]ssh.Signer, error) {
 }
 
 func (a *Agent) signers() ([]ssh.Signer, error) {
-	pk, err := getPublicKey(a.yk, piv.SlotAuthentication)
+	pk, err := getPublicKey(a.yk, a.slot)
 	if err != nil {
 		return nil, err
 	}
 	priv, err := a.yk.PrivateKey(
-		piv.SlotAuthentication,
+		a.slot,
 		pk.(ssh.CryptoPublicKey).CryptoPublicKey(),
 		piv.KeyAuth{PINPrompt: a.getPIN},
 	)
@@ -334,8 +377,12 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 		case alg == ssh.KeyAlgoRSA && flags&agent.SignatureFlagRsaSha512 != 0:
 			alg = ssh.SigAlgoRSASHA2512
 		}
-		// TODO: maybe retry if the PIN is not correct?
-		return s.(ssh.AlgorithmSigner).SignWithAlgorithm(rand.Reader, data, alg)
+		sign, err := s.(ssh.AlgorithmSigner).SignWithAlgorithm(rand.Reader, data, alg)
+		if err != nil {
+			// PIN might be wrong, so let's drop the cached PIN to not keep trying it
+			a.pin = nil
+		}
+		return sign, err
 	}
 	return nil, fmt.Errorf("no private keys match the requested public key")
 }
